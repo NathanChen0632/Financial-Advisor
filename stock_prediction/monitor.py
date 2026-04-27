@@ -31,8 +31,9 @@ except ImportError:
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from stock_prediction.data_collection import download_stock_data, TICKERS
+from stock_prediction.data_collection import download_stock_data, download_spy_context, TICKERS
 from stock_prediction.features import build_features, get_feature_columns
+from stock_prediction.models import fit_feature_scaler
 from stock_prediction.rl_agent import train_dqn_agent
 
 # Alpaca integration is optional — only imported when --alpaca flag is used
@@ -276,21 +277,33 @@ def build_live_feature_row(
 # -------------------------- Model training ------------------------
 
 
-def train_models_on_history(ticker: str, history_df: pd.DataFrame) -> dict:
+def train_models_on_history(ticker: str, history_df: pd.DataFrame, spy_df=None, n_episodes: int = 500) -> dict:
     print(f"  [{ticker}] Building features...")
-    feat_df      = build_features(history_df)
+
+    # Include SPY market context so the live model matches backtest feature space.
+    # Without this, the agent is missing spy_return, spy_momentum20, relative_strength
+    # and gets a different state vector than what it was designed for.
+    feat_df      = build_features(history_df, spy_df=spy_df)
     feature_cols = get_feature_columns(feat_df)
     X            = feat_df[feature_cols].values
     prices       = history_df.loc[feat_df.index, "Close"].values.flatten()
 
-    print(f"  [{ticker}] Training DQN with disciplined strategy on {len(X)} samples...")
+    # Scaler must be fit here so the DQN receives normalized inputs.
+    # Without normalization, RSI (0-100) dominates ATR (0.01) in the Q-network
+    # and the agent makes poor decisions regardless of training length.
+    scaler        = fit_feature_scaler(X)
+    X_scaled      = scaler.transform(X)
+
+    print(f"  [{ticker}] Training DQN — {n_episodes} episodes on {len(X)} days of history...")
     dqn = train_dqn_agent(
         X_train=X,
         daily_returns_train=feat_df["daily_return"].values,
         prices_train=prices,
         feature_cols=feature_cols,
-        n_episodes=50,
+        n_episodes=n_episodes,
+        X_train_scaled=X_scaled,
     )
+    dqn.scaler = scaler
 
     print(f"  [{ticker}] Done.\n")
     return {
@@ -556,17 +569,53 @@ def run_monitor(
 
     history = {}
     trained = {}
-    states  = {}   # ticker -> StrategyState
+    states  = {}
+
+    # Download SPY once and share across all tickers so the live model
+    # has the same market context features as the backtest model.
+    print("[STARTUP] Downloading SPY market context...")
+    try:
+        spy_df = download_spy_context(start="2015-01-01", end=today_str)
+    except Exception:
+        spy_df = None
+        print("[WARN] Could not download SPY — market context features disabled.")
 
     for ticker in tickers:
         print(f"[STARTUP] Downloading history for {ticker}...")
         try:
             history[ticker] = download_stock_data(ticker, start="2015-01-01", end=today_str)
             print(f"[STARTUP] Training models for {ticker}...")
-            trained[ticker] = train_models_on_history(ticker, history[ticker])
+            trained[ticker] = train_models_on_history(ticker, history[ticker], spy_df=spy_df)
             states[ticker]  = StrategyState(ticker=ticker)
         except Exception as e:
             print(f"[ERROR] Could not initialise {ticker}: {e}")
+
+    # Sync open positions from Alpaca so a restart doesn't cause double-entries.
+    # If we were holding AAPL before the script stopped, Alpaca still has the
+    # position — this restores StrategyState so we don't buy it again.
+    if trader is not None and trained:
+        print("\n[STARTUP] Syncing open positions from Alpaca...")
+        restored = trader.sync_positions_from_alpaca(list(trained.keys()))
+        for ticker, info in restored.items():
+            if ticker in states:
+                from stock_prediction.rl_agent import TradingConfig
+                cfg       = TradingConfig()
+                entry     = info["entry_price"]
+                atr_guess = 0.015  # conservative fallback if feature data unavailable
+                try:
+                    feat_df      = build_features(history[ticker], spy_df=spy_df)
+                    feature_cols = get_feature_columns(feat_df)
+                    if "atr14_pct" in feature_cols:
+                        atr_guess = float(feat_df["atr14_pct"].iloc[-1])
+                except Exception:
+                    pass
+                stop_dist  = cfg.stop_atr_mult * atr_guess * entry
+                states[ticker].position     = Position.LONG
+                states[ticker].entry_price  = entry
+                states[ticker].stop_price   = entry - stop_dist
+                states[ticker].target_price = entry + cfg.min_rr_ratio * stop_dist
+                states[ticker].entry_time   = "restored"
+                print(f"  Restored state for {ticker}: entry=${entry:.2f}  stop=${states[ticker].stop_price:.2f}")
 
     if not trained:
         print("[ERROR] No tickers could be initialised. Exiting.")
